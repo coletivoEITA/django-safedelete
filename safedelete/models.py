@@ -1,6 +1,7 @@
 import warnings
 
-from django.db import models, router
+from django.db import models, router, transaction, IntegrityError
+from django.db.models import ProtectedError
 from django.utils import timezone
 
 from .config import (HARD_DELETE, HARD_DELETE_NOCASCADE, NO_DELETE,
@@ -119,10 +120,11 @@ class SafeDeleteModel(models.Model):
 
         if current_policy == SOFT_DELETE_CASCADE:
             for related in related_objects(self):
-                if is_safedelete_cls(related.__class__) and related.deleted and abs((deleted_date - related.deleted).total_seconds()) < 60:
+                if is_safedelete_cls(related.__class__) and related.deleted and abs(
+                        (deleted_date - related.deleted).total_seconds()) < 60:
                     related.undelete()
 
-    def delete(self, force_policy=None, **kwargs):
+    def delete(self, force_policy=None, check_constraints=True, **kwargs):
         """Overrides Django's delete behaviour based on the model's delete policy.
 
         Args:
@@ -137,6 +139,10 @@ class SafeDeleteModel(models.Model):
             return
 
         elif current_policy == SOFT_DELETE:
+
+            # Checks if this delete is possible
+            if check_constraints:
+                self._check_default_model_constraints_on_delete()
 
             # Only soft-delete the object, marking it as deleted.
             self.deleted = timezone.now()
@@ -162,12 +168,17 @@ class SafeDeleteModel(models.Model):
                 self.delete(force_policy=HARD_DELETE, **kwargs)
 
         elif current_policy == SOFT_DELETE_CASCADE:
+
+            # Checks if this delete is possible
+            if check_constraints:
+                self._check_default_model_constraints_on_delete()
+
             # Soft-delete on related objects before
             for related in related_objects(self):
                 if is_safedelete_cls(related.__class__) and not related.deleted:
-                    related.delete(force_policy=SOFT_DELETE, **kwargs)
+                    related.delete(force_policy=SOFT_DELETE, check_constraints=False, **kwargs)
             # soft-delete the object
-            self.delete(force_policy=SOFT_DELETE, **kwargs)
+            self.delete(force_policy=SOFT_DELETE, check_constraints=False, **kwargs)
 
     @classmethod
     def has_unique_fields(cls):
@@ -218,6 +229,18 @@ class SafeDeleteModel(models.Model):
                     self.unique_error_message(model_class, unique_check)
                 )
         return errors
+
+    def _check_default_model_constraints_on_delete(self):
+        """ Checks if the model will pass the default constraints before delete."""
+
+        # Try to HARD_DELETE in a transaction. If some error is thrown, return this error
+        sid = transaction.savepoint()
+        try:
+            self.delete(force_policy=HARD_DELETE)
+        except (IntegrityError, ProtectedError):
+            raise
+        finally:
+            transaction.savepoint_rollback(sid)
 
 
 class SafeDeleteMixin(SafeDeleteModel):
